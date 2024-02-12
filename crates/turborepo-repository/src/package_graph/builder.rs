@@ -1,7 +1,7 @@
 use std::{
     backtrace::Backtrace,
     collections::{BTreeMap, HashMap, HashSet},
-    fmt,
+    fmt, io,
 };
 
 use petgraph::graph::{Graph, NodeIndex};
@@ -12,6 +12,7 @@ use turbopath::{
 };
 use turborepo_graph_utils as graph;
 use turborepo_lockfiles::Lockfile;
+use turborepo_telemetry::events::{generic::GenericEventBuilder, TrackedErrors};
 
 use super::{PackageGraph, WorkspaceInfo, WorkspaceName, WorkspaceNode};
 use crate::{
@@ -20,7 +21,7 @@ use crate::{
         PackageDiscoveryBuilder,
     },
     package_graph::{PackageName, PackageVersion},
-    package_json::PackageJson,
+    package_json::{self, PackageJson},
 };
 
 pub struct PackageGraphBuilder<'a, T> {
@@ -29,6 +30,7 @@ pub struct PackageGraphBuilder<'a, T> {
     is_single_package: bool,
     package_jsons: Option<HashMap<AbsoluteSystemPathBuf, PackageJson>>,
     lockfile: Option<Box<dyn Lockfile>>,
+    telemetry: Option<GenericEventBuilder>,
     package_discovery: T,
 }
 
@@ -75,6 +77,7 @@ impl<'a> PackageGraphBuilder<'a, LocalPackageDiscoveryBuilder> {
             is_single_package: false,
             package_jsons: None,
             lockfile: None,
+            telemetry: None,
         }
     }
 }
@@ -91,6 +94,11 @@ impl<'a, P> PackageGraphBuilder<'a, P> {
         package_jsons: Option<HashMap<AbsoluteSystemPathBuf, PackageJson>>,
     ) -> Self {
         self.package_jsons = package_jsons;
+        self
+    }
+
+    pub fn with_telemetry(mut self, telemetry: Option<GenericEventBuilder>) -> Self {
+        self.telemetry = telemetry;
         self
     }
 
@@ -114,6 +122,7 @@ impl<'a, P> PackageGraphBuilder<'a, P> {
             package_jsons: self.package_jsons,
             lockfile: self.lockfile,
             package_discovery: discovery,
+            telemetry: self.telemetry,
         }
     }
 }
@@ -151,6 +160,7 @@ struct BuildState<'a, S, T> {
     package_jsons: Option<HashMap<AbsoluteSystemPathBuf, PackageJson>>,
     state: std::marker::PhantomData<S>,
     package_discovery: T,
+    telemetry: Option<GenericEventBuilder>,
 }
 
 // Allows us to perform workspace discovery and parse package jsons
@@ -197,6 +207,7 @@ where
             package_jsons,
             lockfile,
             package_discovery,
+            telemetry,
         } = builder;
         let mut workspaces = HashMap::new();
         workspaces.insert(
@@ -221,6 +232,7 @@ where
             package_discovery: CachingPackageDiscovery::new(
                 package_discovery.build().map_err(Into::into)?,
             ),
+            telemetry,
         })
     }
 }
@@ -272,13 +284,28 @@ impl<'a, T: PackageDiscovery> BuildState<'a, ResolvedPackageManager, T> {
             None => {
                 let mut jsons = HashMap::new();
                 for path in self.package_discovery.discover_packages().await?.workspaces {
-                    let json = PackageJson::load(&path.package_json)?;
-                    jsons.insert(path.package_json, json);
+                    match PackageJson::load(&path.package_json) {
+                        Ok(json) => {
+                            jsons.insert(path.package_json, json);
+                        }
+                        // if we get here, it could stem from a package watch error, so we should
+                        // fall back to the more expensive local discovery and log a telemetry event
+                        Err(package_json::Error::Io(io))
+                            if io.kind() == io::ErrorKind::NotFound =>
+                        {
+                            if let Some(telemetry) = self.telemetry {
+                                telemetry.track_error(TrackedErrors::InvalidPackageDiscovery);
+                            }
+                            return Err(package_json::Error::Io(io).into());
+                        }
+                        Err(e) => return Err(e.into()),
+                    };
                 }
                 Ok::<_, Error>(jsons)
             }
         }?;
 
+        // if package discovery produces
         for (path, json) in package_jsons {
             match self.add_json(path, json) {
                 Ok(()) => {}
@@ -302,6 +329,7 @@ impl<'a, T: PackageDiscovery> BuildState<'a, ResolvedPackageManager, T> {
             node_lookup,
             lockfile,
             package_discovery,
+            telemetry,
             ..
         } = self;
         Ok(BuildState {
@@ -314,6 +342,7 @@ impl<'a, T: PackageDiscovery> BuildState<'a, ResolvedPackageManager, T> {
             package_discovery,
             package_jsons: None,
             state: std::marker::PhantomData,
+            telemetry,
         })
     }
 
@@ -439,6 +468,7 @@ impl<'a, T: PackageDiscovery> BuildState<'a, ResolvedWorkspaces, T> {
             workspace_graph,
             node_lookup,
             package_discovery,
+            telemetry,
             ..
         } = self;
         Ok(BuildState {
@@ -451,6 +481,7 @@ impl<'a, T: PackageDiscovery> BuildState<'a, ResolvedWorkspaces, T> {
             package_jsons: None,
             state: std::marker::PhantomData,
             package_discovery,
+            telemetry,
         })
     }
 }
